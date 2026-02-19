@@ -1,0 +1,25 @@
+# Binaries
+bin/
+dist/
+*.exe
+*.out
+
+# Build and coverage
+coverage.out
+*.test
+
+# Run artifacts
+.qa-agent/
+runs/
+artifacts/
+
+# Databases and local state
+*.sqlite
+*.sqlite3
+*.db
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+

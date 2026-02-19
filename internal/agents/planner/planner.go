@@ -1,0 +1,160 @@
+package planner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"qa-agent/internal/agents/runtime"
+	"qa-agent/internal/blackboard"
+	"qa-agent/internal/model"
+)
+
+type Output struct {
+	FeatureSpec   model.FeatureSpec `json:"feature_spec"`
+	TestPlan      model.TestPlan    `json:"test_plan"`
+	Tasks         []model.Task      `json:"tasks"`
+	OpenQuestions []string          `json:"open_questions,omitempty"`
+}
+
+type Agent struct {
+	runtime *runtime.Runtime
+	store   *blackboard.Store
+}
+
+func New(runtime *runtime.Runtime, store *blackboard.Store) *Agent {
+	return &Agent{
+		runtime: runtime,
+		store:   store,
+	}
+}
+
+func (a *Agent) Plan(ctx context.Context, runID, description string, surfaces []model.Surface) (Output, error) {
+	if strings.TrimSpace(runID) == "" {
+		return Output{}, errors.New("run_id is required")
+	}
+	if strings.TrimSpace(description) == "" {
+		return Output{}, errors.New("description is required")
+	}
+	if len(surfaces) == 0 {
+		surfaces = []model.Surface{model.SurfaceWeb}
+	}
+
+	_, _ = a.runtime.RunTurn(ctx, runtime.TurnRequest{
+		RunID:     runID,
+		AgentName: "planner",
+		Prompt:    description,
+	})
+
+	criteria := splitCriteria(description)
+	openQuestions := buildOpenQuestions(description)
+	testPlanJourneys := make([]string, 0, len(criteria))
+	assertions := make([]string, 0, len(criteria))
+	tasks := make([]model.Task, 0, len(criteria)*len(surfaces))
+
+	for idx, criterion := range criteria {
+		testPlanJourneys = append(testPlanJourneys, fmt.Sprintf("journey_%d", idx+1))
+		assertions = append(assertions, criterion.Text)
+		for _, surface := range surfaces {
+			taskID := fmt.Sprintf("task_%s_%d_%s", runID, idx+1, surface)
+			tasks = append(tasks, model.Task{
+				SchemaVersion: model.CurrentSchemaVersion,
+				TaskID:        taskID,
+				RunID:         runID,
+				Surface:       surface,
+				Kind:          model.TaskKindProof,
+				Priority:      model.PriorityP1,
+				Status:        model.TaskStatusQueued,
+				DedupeKey:     fmt.Sprintf("%s:%s:%d", surface, runID, idx+1),
+				MaxAttempts:   3,
+				CreatedBy:     "planner",
+				AcceptanceCriteriaIDs: []string{
+					criterion.ID,
+				},
+			})
+		}
+	}
+
+	output := Output{
+		FeatureSpec: model.FeatureSpec{
+			SchemaVersion:      model.CurrentSchemaVersion,
+			RunID:              runID,
+			Description:        description,
+			AcceptanceCriteria: criteria,
+			Surfaces:           surfaces,
+			OpenQuestions:      openQuestions,
+		},
+		TestPlan: model.TestPlan{
+			SchemaVersion: model.CurrentSchemaVersion,
+			RunID:         runID,
+			Journeys:      testPlanJourneys,
+			Assertions:    assertions,
+		},
+		Tasks:         tasks,
+		OpenQuestions: openQuestions,
+	}
+	if err := ValidateOutput(output); err != nil {
+		return Output{}, err
+	}
+
+	if err := a.store.UpsertFeatureSpec(ctx, output.FeatureSpec); err != nil {
+		return Output{}, err
+	}
+	for _, task := range output.Tasks {
+		if err := a.store.CreateTask(ctx, task); err != nil {
+			return Output{}, err
+		}
+	}
+	return output, nil
+}
+
+func ValidateOutput(output Output) error {
+	if err := output.FeatureSpec.Validate(); err != nil {
+		return err
+	}
+	if err := output.TestPlan.Validate(); err != nil {
+		return err
+	}
+	if len(output.Tasks) == 0 {
+		return errors.New("planner output requires tasks")
+	}
+	for i, task := range output.Tasks {
+		if err := task.Validate(); err != nil {
+			return fmt.Errorf("task[%d] invalid: %w", i, err)
+		}
+		if strings.TrimSpace(task.DedupeKey) == "" {
+			return fmt.Errorf("task[%d] missing dedupe_key", i)
+		}
+	}
+	return nil
+}
+
+func splitCriteria(description string) []model.AcceptanceCriterion {
+	segments := strings.Split(description, ".")
+	criteria := make([]model.AcceptanceCriterion, 0, len(segments))
+	for index, segment := range segments {
+		text := strings.TrimSpace(segment)
+		if text == "" {
+			continue
+		}
+		criteria = append(criteria, model.AcceptanceCriterion{
+			ID:   fmt.Sprintf("ac_%d", index+1),
+			Text: text,
+		})
+	}
+	if len(criteria) == 0 {
+		criteria = append(criteria, model.AcceptanceCriterion{
+			ID:   "ac_1",
+			Text: strings.TrimSpace(description),
+		})
+	}
+	return criteria
+}
+
+func buildOpenQuestions(description string) []string {
+	if strings.Contains(description, "?") {
+		return []string{"Clarify ambiguous requirement from feature description"}
+	}
+	return nil
+}
