@@ -359,6 +359,7 @@ func TestQA_Golden_StabilityClassification(t *testing.T) {
 		{"blocked only", []model.RunOutcome{model.RunOutcomeBlocked}, stability.OutcomeBlocked},
 		{"error only", []model.RunOutcome{model.RunOutcomeError}, stability.OutcomeError},
 		{"pass fail pass pass", []model.RunOutcome{model.RunOutcomePass, model.RunOutcomeFail, model.RunOutcomePass, model.RunOutcomePass}, stability.OutcomeFlaky},
+		{"single pass is inconclusive", []model.RunOutcome{model.RunOutcomePass}, stability.OutcomeInconclusive},
 		{"three passes", []model.RunOutcome{model.RunOutcomePass, model.RunOutcomePass, model.RunOutcomePass}, stability.OutcomeStablePass},
 	}
 
@@ -1545,8 +1546,8 @@ func TestQA_Adversarial_ModelValidation(t *testing.T) {
 // SECTION 5: BUG REPRODUCTION TESTS — confirms documented bugs
 // ===================================================================
 
-func TestBug_B1_NoRetryOnFailure(t *testing.T) {
-	// BUG B1: Failed tasks are never retried despite MaxAttempts=3
+func TestBug_B1_RetryOnFailure(t *testing.T) {
+	// BUG B1: Failed tasks should be retried up to MaxAttempts
 	store := newTestStore(t)
 	runID := "run_bug_b1"
 
@@ -1584,16 +1585,15 @@ func TestBug_B1_NoRetryOnFailure(t *testing.T) {
 	callCount := len(exec.calls)
 	exec.mu.Unlock()
 
-	// BUG: task executes only once despite MaxAttempts=3
-	if callCount > 1 {
-		t.Logf("BUG B1 FIXED: task retried %d times", callCount)
+	if callCount <= 1 {
+		t.Errorf("BUG B1 NOT FIXED: task executed only %d time(s) despite MaxAttempts=3", callCount)
 	} else {
-		t.Logf("BUG B1 CONFIRMED: task executed only %d time(s) despite MaxAttempts=3", callCount)
+		t.Logf("BUG B1 FIXED: task retried %d times", callCount)
 	}
 }
 
-func TestBug_B2_JudgeIgnoresFlakiness(t *testing.T) {
-	// BUG B2: Criterion with both pass+fail runs immediately gets FAIL verdict
+func TestBug_B2_JudgeHandlesFlakiness(t *testing.T) {
+	// BUG B2: Criterion with both pass+fail runs should NOT immediately get FAIL verdict
 	judge := judgeagent.New()
 	runID := "run_bug_b2"
 
@@ -1619,9 +1619,11 @@ func TestBug_B2_JudgeIgnoresFlakiness(t *testing.T) {
 	}
 
 	if out.Verdict != nil && out.Verdict.Status == model.VerdictFail {
-		t.Log("BUG B2 CONFIRMED: criterion with pass+fail runs gets immediate FAIL verdict (flakiness ignored)")
+		t.Errorf("BUG B2 NOT FIXED: criterion with pass+fail runs gets immediate FAIL verdict")
+	} else if len(out.NextTasks) > 0 {
+		t.Logf("BUG B2 FIXED: judge requests more evidence for flaky criterion (%d next tasks)", len(out.NextTasks))
 	} else {
-		t.Log("BUG B2 FIXED: judge correctly handles flaky criterion")
+		t.Logf("BUG B2 FIXED: judge returned %v", out)
 	}
 }
 
@@ -1655,18 +1657,20 @@ func TestBug_B5_JudgeMultiRoundNoop(t *testing.T) {
 	}
 }
 
-func TestBug_B6_SinglePassIsFlaky(t *testing.T) {
-	// BUG B6: A single pass is classified as "flaky"
+func TestBug_B6_SinglePassIsInconclusive(t *testing.T) {
+	// BUG B6: A single pass should be classified as "inconclusive", not "flaky"
 	got := stability.Classify([]model.RunOutcome{model.RunOutcomePass}, 2)
 	if got == stability.OutcomeFlaky {
-		t.Log("BUG B6 CONFIRMED: single pass classified as 'flaky' instead of inconclusive/needs-retry")
+		t.Errorf("BUG B6 NOT FIXED: single pass classified as 'flaky'")
+	} else if got == stability.OutcomeInconclusive {
+		t.Logf("BUG B6 FIXED: single pass classified as %q", got)
 	} else {
 		t.Logf("BUG B6 FIXED: single pass classified as %q", got)
 	}
 }
 
-func TestBug_B7_TruncationCorruptsUTF8(t *testing.T) {
-	// BUG B7: Byte-level truncation can corrupt multi-byte UTF-8
+func TestBug_B7_TruncationPreservesUTF8(t *testing.T) {
+	// BUG B7: Truncation should produce valid UTF-8
 	store := newTestStore(t)
 	ctx := context.Background()
 	runID := "run_bug_b7"
@@ -1693,13 +1697,12 @@ func TestBug_B7_TruncationCorruptsUTF8(t *testing.T) {
 		t.Fatalf("Process: %v", err)
 	}
 
-	// Read the normalized file and check for valid UTF-8
 	for _, ev := range result.Evidence {
 		raw, _ := os.ReadFile(ev.Path)
 		if !utf8.Valid(raw) {
-			t.Log("BUG B7 CONFIRMED: truncated file contains invalid UTF-8")
+			t.Errorf("BUG B7 NOT FIXED: truncated file contains invalid UTF-8")
 		} else {
-			t.Log("BUG B7 FIXED: truncated file is valid UTF-8")
+			t.Logf("BUG B7 FIXED: truncated file is valid UTF-8 (%d bytes)", len(raw))
 		}
 	}
 }
@@ -1742,8 +1745,8 @@ func TestBug_B10_RedactionSwallowsContent(t *testing.T) {
 	}
 }
 
-func TestBug_B11_FlakyMappedToErrored(t *testing.T) {
-	// BUG B11: RunOutcomeFlaky is mapped to TaskStatusErrored
+func TestBug_B11_FlakyMappedCorrectly(t *testing.T) {
+	// BUG B11: RunOutcomeFlaky should map to TaskStatusFailed, not TaskStatusErrored
 	store := newTestStore(t)
 	runID := "run_bug_b11"
 
@@ -1777,12 +1780,11 @@ func TestBug_B11_FlakyMappedToErrored(t *testing.T) {
 		RunID: runID, Description: "flaky", Surfaces: []model.Surface{model.SurfaceWeb},
 	})
 
-	// Check what status the task ended up with
 	tasks, _ := store.TaskList(context.Background(), blackboard.TaskFilter{RunID: runID, Limit: 100})
 	for _, task := range tasks {
 		if task.TaskID == "t1" {
 			if task.Status == model.TaskStatusErrored {
-				t.Log("BUG B11 CONFIRMED: RunOutcomeFlaky mapped to TaskStatusErrored")
+				t.Errorf("BUG B11 NOT FIXED: RunOutcomeFlaky still mapped to TaskStatusErrored")
 			} else {
 				t.Logf("BUG B11 FIXED: RunOutcomeFlaky mapped to %s", task.Status)
 			}

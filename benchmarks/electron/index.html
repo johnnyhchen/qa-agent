@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Notes</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: flex; height: 100vh; }
+    body.dark { background: #1e1e1e; color: #d4d4d4; }
+
+    /* Sidebar */
+    #sidebar { width: 250px; background: #f5f5f5; border-right: 1px solid #ddd; display: flex; flex-direction: column; }
+    body.dark #sidebar { background: #252526; border-color: #404040; }
+    #sidebar-header { padding: 12px; display: flex; gap: 8px; align-items: center; }
+    #search { flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    body.dark #search { background: #3c3c3c; border-color: #555; color: #d4d4d4; }
+    #new-note-btn { padding: 6px 12px; background: #007aff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    #note-list { flex: 1; overflow-y: auto; }
+    .note-item { padding: 10px 12px; border-bottom: 1px solid #e5e5e5; cursor: pointer; }
+    body.dark .note-item { border-color: #404040; }
+    .note-item.active { background: #007aff; color: white; }
+    .note-item-title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .note-item-preview { font-size: 11px; color: #888; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .note-item.active .note-item-preview { color: rgba(255,255,255,0.7); }
+    #note-count { padding: 8px 12px; font-size: 11px; color: #888; border-top: 1px solid #e5e5e5; }
+    body.dark #note-count { border-color: #404040; }
+
+    /* Editor */
+    #editor { flex: 1; display: flex; flex-direction: column; }
+    #editor-toolbar { padding: 8px 12px; border-bottom: 1px solid #ddd; display: flex; gap: 8px; align-items: center; }
+    body.dark #editor-toolbar { border-color: #404040; }
+    #note-title { flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; font-weight: 600; }
+    body.dark #note-title { background: #3c3c3c; border-color: #555; color: #d4d4d4; }
+    #delete-btn { padding: 6px 12px; background: #ff3b30; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    #dark-mode-btn { padding: 6px 12px; background: #555; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    #note-body { flex: 1; padding: 12px; border: none; resize: none; font-size: 14px; line-height: 1.6; font-family: inherit; }
+    body.dark #note-body { background: #1e1e1e; color: #d4d4d4; }
+    #editor-status { padding: 6px 12px; font-size: 11px; color: #888; border-top: 1px solid #eee; }
+    body.dark #editor-status { border-color: #404040; }
+
+    /* Empty state */
+    #empty-state { flex: 1; display: flex; align-items: center; justify-content: center; color: #999; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <input type="text" id="search" placeholder="Search notes...">
+      <button id="new-note-btn">+ New</button>
+    </div>
+    <div id="note-list"></div>
+    <div id="note-count">0 notes</div>
+  </div>
+  <div id="editor">
+    <div id="editor-toolbar">
+      <input type="text" id="note-title" placeholder="Note title...">
+      <button id="dark-mode-btn">Dark</button>
+      <button id="delete-btn">Delete</button>
+    </div>
+    <textarea id="note-body" placeholder="Start writing..."></textarea>
+    <div id="editor-status">Ready</div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const BUGGY = params.get("mode") === "buggy";
+
+    let notes = [];
+    let activeNoteId = null;
+    let saveTimeout = null;
+
+    const noteList = document.getElementById("note-list");
+    const noteCount = document.getElementById("note-count");
+    const noteTitle = document.getElementById("note-title");
+    const noteBody = document.getElementById("note-body");
+    const searchInput = document.getElementById("search");
+    const editorStatus = document.getElementById("editor-status");
+    const newNoteBtn = document.getElementById("new-note-btn");
+    const deleteBtn = document.getElementById("delete-btn");
+    const darkModeBtn = document.getElementById("dark-mode-btn");
+
+    function generateId() {
+      return "note_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+    }
+
+    function renderNoteList(filter) {
+      noteList.innerHTML = "";
+      let filtered = notes;
+      if (filter) {
+        const q = filter.toLowerCase();
+        if (BUGGY) {
+          // ELEC-3: Search only checks titles, misses body content
+          filtered = notes.filter(n => n.title.toLowerCase().includes(q));
+        } else {
+          filtered = notes.filter(n =>
+            n.title.toLowerCase().includes(q) || n.body.toLowerCase().includes(q)
+          );
+        }
+      }
+
+      filtered.forEach(note => {
+        const div = document.createElement("div");
+        div.className = "note-item" + (note.id === activeNoteId ? " active" : "");
+        div.innerHTML = `
+          <div class="note-item-title">${escapeHtml(note.title || "Untitled")}</div>
+          <div class="note-item-preview">${escapeHtml(note.body.slice(0, 60) || "Empty note")}</div>
+        `;
+        div.addEventListener("click", () => selectNote(note.id));
+        noteList.appendChild(div);
+      });
+
+      if (BUGGY) {
+        // ELEC-2: Note count shows wrong number (always shows total, ignoring filter)
+        noteCount.textContent = notes.length + " notes";
+      } else {
+        noteCount.textContent = filtered.length + " note" + (filtered.length !== 1 ? "s" : "");
+      }
+    }
+
+    function selectNote(id) {
+      activeNoteId = id;
+      const note = notes.find(n => n.id === id);
+      if (note) {
+        noteTitle.value = note.title;
+        noteBody.value = note.body;
+        editorStatus.textContent = "Editing: " + (note.title || "Untitled");
+      }
+      renderNoteList(searchInput.value);
+    }
+
+    function createNote() {
+      const note = {
+        id: generateId(),
+        title: "",
+        body: "",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      notes.unshift(note);
+      selectNote(note.id);
+      noteTitle.focus();
+      scheduleSave();
+    }
+
+    function deleteNote() {
+      if (!activeNoteId) return;
+      if (BUGGY) {
+        // ELEC-5: Delete removes from UI but not from data array
+        const idx = notes.findIndex(n => n.id === activeNoteId);
+        if (idx !== -1) {
+          // Only visually removes — doesn't actually splice
+          activeNoteId = notes.length > 1 ? notes[idx === 0 ? 1 : 0].id : null;
+          renderNoteList(searchInput.value);
+          if (activeNoteId) selectNote(activeNoteId);
+          else clearEditor();
+          editorStatus.textContent = "Deleted";
+          return;
+        }
+      }
+      notes = notes.filter(n => n.id !== activeNoteId);
+      activeNoteId = notes.length > 0 ? notes[0].id : null;
+      if (activeNoteId) selectNote(activeNoteId);
+      else clearEditor();
+      renderNoteList(searchInput.value);
+      scheduleSave();
+      editorStatus.textContent = "Deleted";
+    }
+
+    function clearEditor() {
+      noteTitle.value = "";
+      noteBody.value = "";
+      editorStatus.textContent = "No note selected";
+    }
+
+    function updateActiveNote() {
+      if (!activeNoteId) return;
+      const note = notes.find(n => n.id === activeNoteId);
+      if (!note) return;
+      note.title = noteTitle.value;
+      note.body = noteBody.value;
+      note.updatedAt = new Date().toISOString();
+      renderNoteList(searchInput.value);
+      scheduleSave();
+      editorStatus.textContent = "Saved";
+    }
+
+    function scheduleSave() {
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(async () => {
+        if (window.notesAPI) {
+          await window.notesAPI.save(notes);
+        }
+      }, 500);
+    }
+
+    function toggleDarkMode() {
+      if (BUGGY) {
+        // ELEC-1: Dark mode toggle doesn't work (class never applied)
+        editorStatus.textContent = "Dark mode toggled";
+        return;
+      }
+      document.body.classList.toggle("dark");
+      darkModeBtn.textContent = document.body.classList.contains("dark") ? "Light" : "Dark";
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Event listeners
+    newNoteBtn.addEventListener("click", createNote);
+    deleteBtn.addEventListener("click", deleteNote);
+    darkModeBtn.addEventListener("click", toggleDarkMode);
+    noteTitle.addEventListener("input", updateActiveNote);
+    noteBody.addEventListener("input", updateActiveNote);
+    searchInput.addEventListener("input", () => renderNoteList(searchInput.value));
+
+    // Load notes on startup
+    (async function init() {
+      if (window.notesAPI) {
+        notes = await window.notesAPI.load();
+      }
+      if (notes.length === 0) {
+        // Create a welcome note
+        notes.push({
+          id: generateId(),
+          title: "Welcome",
+          body: "This is a sample note. Try creating, editing, searching, and deleting notes.",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+      renderNoteList();
+      if (notes.length > 0) selectNote(notes[0].id);
+    })();
+  </script>
+</body>
+</html>

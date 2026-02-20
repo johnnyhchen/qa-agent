@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""
+Adapter: bridges qa-agent's subprocess protocol to the `browser` CLI.
+
+Usage: ai-browser-use run --input INPUT_FILE --output OUTPUT_FILE
+
+Reads CLIInput JSON, starts browser serve if needed, translates steps into
+browser CLI calls, checks assertions, and writes CLIOutput JSON.
+
+Step format:
+  goto <url>               → browser goto <url>
+  click "<text>"           → browser find "<text>" → browser click <ref>
+  fill "<label>" <value>   → browser find "<label>" → browser fill <ref> <value>
+  type <text>              → browser type <text>
+  press <key>              → browser press <key>
+  wait text "<text>"       → browser wait text "<text>"
+  eval <js>                → browser eval <js>
+  screenshot [path]        → browser screenshot <path>
+
+Assertion format (checked against page text):
+  text "<expected>"        → browser text, check if expected string is present
+  eval <js_expression>     → browser eval, check if result is truthy
+  element "<text>" visible → browser find "<text>", check ref exists
+"""
+
+import argparse
+import atexit
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+_server_proc = None
+
+
+def start_server_if_needed():
+    """Start browser serve --backend selenium --headless if not already running."""
+    global _server_proc
+
+    # Check if server is already running
+    try:
+        result = subprocess.run(
+            ["browser", "status"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and "running" in result.stdout.lower():
+            return True, "server already running"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Start the server
+    try:
+        _server_proc = subprocess.Popen(
+            ["browser", "serve", "--backend", "selenium", "--headless"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        atexit.register(stop_server)
+
+        # Wait for server to be ready
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                result = subprocess.run(
+                    ["browser", "status"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    return True, "server started"
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+
+        return False, "server failed to start within 30s"
+    except FileNotFoundError:
+        return False, "browser CLI not found in PATH"
+    except Exception as e:
+        return False, f"failed to start server: {e}"
+
+
+def stop_server():
+    """Stop the browser server if we started it."""
+    global _server_proc
+    if _server_proc and _server_proc.poll() is None:
+        _server_proc.terminate()
+        try:
+            _server_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _server_proc.kill()
+        _server_proc = None
+
+
+def run_cmd(cmd_parts, timeout=30):
+    """Run a browser CLI command and return (stdout, stderr, returncode)."""
+    try:
+        result = subprocess.run(
+            ["browser"] + cmd_parts,
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return result.stdout.strip(), result.stderr.strip(), result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "command timed out", 1
+    except Exception as e:
+        return "", str(e), 1
+
+
+def find_ref(text_query):
+    """Use browser find to locate an element by text, return its ref or None."""
+    stdout, stderr, rc = run_cmd(["find", text_query, "--json"])
+    if rc != 0:
+        return None, f"find failed: {stderr}"
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, list) and len(data) > 0:
+            ref = data[0].get("ref") or data[0].get("id")
+            if ref:
+                return str(ref), ""
+        elif isinstance(data, dict):
+            ref = data.get("ref") or data.get("id")
+            if ref:
+                return str(ref), ""
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+
+    # Fallback: parse text output for ref pattern like "[ref=e5]" or "e5:"
+    stdout_text, _, rc2 = run_cmd(["find", text_query])
+    if rc2 == 0 and stdout_text:
+        # Look for patterns like "e5" or "[e5]" at start of lines
+        match = re.search(r'\b(e\d+)\b', stdout_text)
+        if match:
+            return match.group(1), ""
+
+    return None, f"no element found for '{text_query}'"
+
+
+def parse_quoted(s):
+    """Extract a quoted string from the beginning of s. Returns (quoted_content, rest)."""
+    s = s.strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end != -1:
+            return s[1:end], s[end + 1:].strip()
+    elif s.startswith("'"):
+        end = s.find("'", 1)
+        if end != -1:
+            return s[1:end], s[end + 1:].strip()
+    # No quotes — take first word
+    parts = s.split(None, 1)
+    return parts[0] if parts else s, parts[1] if len(parts) > 1 else ""
+
+
+def execute_step(step, artifact_dir, step_num):
+    """Execute a single step. Returns (success, detail)."""
+    step = step.strip()
+    step_lower = step.lower()
+
+    if step_lower.startswith("goto "):
+        url = step[5:].strip()
+        stdout, stderr, rc = run_cmd(["goto", url])
+        if rc != 0:
+            return False, f"goto failed: {stderr}"
+        # Wait for page load
+        run_cmd(["wait", "load"], timeout=10)
+        return True, f"navigated to {url}"
+
+    elif step_lower.startswith("click "):
+        target = step[6:].strip().strip('"').strip("'")
+        is_css = target.startswith("#") or target.startswith(".") or target.startswith("[")
+        if is_css:
+            # CSS selector — use eval to click
+            stdout, stderr, rc = run_cmd([
+                "eval",
+                f'(function() {{ var el = document.querySelector("{target}"); if (!el) return "not_found"; el.click(); return "clicked"; }})()'
+            ])
+            if rc == 0 and "clicked" in stdout:
+                return True, f"clicked CSS selector: {target}"
+            return False, f"CSS selector not found: {target} (eval: {stdout})"
+        else:
+            # Text-based — use browser find to get ref, then click
+            ref, err = find_ref(target)
+            if ref:
+                stdout, stderr, rc = run_cmd(["click", ref])
+                if rc == 0:
+                    return True, f"clicked '{target}' (ref={ref})"
+                return False, f"click ref {ref} failed: {stderr}"
+            # Fallback: try submitting a form (for "Sign In" type buttons)
+            stdout, stderr, rc = run_cmd([
+                "eval",
+                f'''(function() {{
+                    var btns = document.querySelectorAll("button, input[type=submit]");
+                    for (var b of btns) {{
+                        if (b.textContent.trim().toLowerCase().includes("{target.lower()}")) {{
+                            b.click(); return "clicked";
+                        }}
+                    }}
+                    return "not_found";
+                }})()'''
+            ])
+            if rc == 0 and "clicked" in stdout:
+                return True, f"clicked button by text: {target}"
+            return False, f"click target not found: {target} ({err})"
+
+    elif step_lower.startswith("fill "):
+        rest = step[5:].strip()
+        label, value = parse_quoted(rest)
+        value = value.strip().strip('"').strip("'")
+        is_css = label.startswith("#") or label.startswith(".") or label.startswith("[")
+        if is_css:
+            # CSS selector — use eval to fill
+            escaped_value = value.replace("\\", "\\\\").replace('"', '\\"')
+            stdout, stderr, rc = run_cmd([
+                "eval",
+                f'''(function() {{
+                    var el = document.querySelector("{label}");
+                    if (!el) return "not_found";
+                    el.focus();
+                    el.value = "{escaped_value}";
+                    el.dispatchEvent(new Event("input", {{bubbles: true}}));
+                    el.dispatchEvent(new Event("change", {{bubbles: true}}));
+                    return "filled";
+                }})()'''
+            ])
+            if rc == 0 and "filled" in stdout:
+                return True, f"filled CSS {label} = {value}"
+            return False, f"CSS fill target not found: {label} (eval: {stdout})"
+        else:
+            ref, err = find_ref(label)
+            if ref:
+                stdout, stderr, rc = run_cmd(["fill", ref, value])
+                if rc == 0:
+                    return True, f"filled '{label}' (ref={ref}) with '{value}'"
+                return False, f"fill ref {ref} failed: {stderr}"
+            return False, f"fill target not found: {label} ({err})"
+
+    elif step_lower.startswith("type "):
+        text = step[5:].strip().strip('"').strip("'")
+        stdout, stderr, rc = run_cmd(["type", text])
+        if rc != 0:
+            return False, f"type failed: {stderr}"
+        return True, f"typed '{text}'"
+
+    elif step_lower.startswith("press "):
+        key = step[6:].strip()
+        stdout, stderr, rc = run_cmd(["press", key])
+        if rc != 0:
+            return False, f"press failed: {stderr}"
+        return True, f"pressed {key}"
+
+    elif step_lower.startswith("wait text "):
+        text = step[10:].strip().strip('"').strip("'")
+        stdout, stderr, rc = run_cmd(["wait", "text", text], timeout=15)
+        if rc != 0:
+            return False, f"wait text failed: {stderr}"
+        return True, f"text '{text}' appeared"
+
+    elif step_lower.startswith("wait "):
+        target = step[5:].strip()
+        stdout, stderr, rc = run_cmd(["wait", "text", target], timeout=15)
+        if rc != 0:
+            return False, f"wait failed: {stderr}"
+        return True, f"waited for '{target}'"
+
+    elif step_lower.startswith("eval "):
+        code = step[5:].strip()
+        stdout, stderr, rc = run_cmd(["eval", code])
+        if rc != 0:
+            return False, f"eval failed: {stderr}"
+        return True, f"eval result: {stdout[:200]}"
+
+    elif step_lower.startswith("screenshot"):
+        rest = step[10:].strip() if len(step) > 10 else ""
+        path = rest or os.path.join(artifact_dir, f"step_{step_num}.png")
+        stdout, stderr, rc = run_cmd(["screenshot", path])
+        if rc != 0:
+            return False, f"screenshot failed: {stderr}"
+        return True, f"screenshot saved to {path}"
+
+    else:
+        return False, f"unknown step command: {step}"
+
+
+def check_assertion(assertion, artifact_dir, idx):
+    """Check a single assertion. Returns (passed, detail)."""
+    assertion = assertion.strip()
+    assertion_lower = assertion.lower()
+
+    if assertion_lower.startswith("eval "):
+        code = assertion[5:].strip()
+        stdout, stderr, rc = run_cmd(["eval", code])
+        if rc != 0:
+            return False, f"eval assertion failed: {stderr}"
+        result = stdout.strip().lower()
+        passed = result not in ("false", "null", "undefined", "0", "")
+        return passed, f"eval returned: {stdout.strip()}"
+
+    elif assertion_lower.startswith("element ") and assertion_lower.endswith("visible"):
+        text = assertion[8:].rsplit("visible", 1)[0].strip().strip('"').strip("'")
+        ref, err = find_ref(text)
+        if ref:
+            return True, f"element '{text}' found (ref={ref})"
+        return False, f"element '{text}' not visible ({err})"
+
+    elif assertion_lower.startswith("no element "):
+        text = assertion[11:].strip().strip('"').strip("'")
+        ref, err = find_ref(text)
+        if ref:
+            return False, f"element '{text}' unexpectedly found (ref={ref})"
+        return True, f"element '{text}' correctly absent"
+
+    elif assertion_lower.startswith("text "):
+        expected = assertion[5:].strip().strip('"').strip("'")
+        return check_text_present(expected)
+
+    elif assertion_lower.startswith("no text "):
+        expected = assertion[8:].strip().strip('"').strip("'")
+        found, detail = check_text_present(expected)
+        if found:
+            return False, f"text '{expected}' unexpectedly present"
+        return True, f"text '{expected}' correctly absent"
+
+    else:
+        # Default: treat entire assertion as text to search for
+        return check_text_present(assertion)
+
+
+def check_text_present(expected):
+    """Check if expected text is present on the page."""
+    # Try browser text first
+    stdout, stderr, rc = run_cmd(["text"])
+    if rc == 0:
+        if expected.lower() in stdout.lower():
+            return True, f"found '{expected}' in page text"
+
+    # Also try reading the DOM via eval
+    stdout2, stderr2, rc2 = run_cmd(["eval", "document.body?.innerText || ''"])
+    if rc2 == 0:
+        if expected.lower() in stdout2.lower():
+            return True, f"found '{expected}' in DOM text"
+
+    return False, f"'{expected}' not found in page"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ai-browser-use adapter")
+    parser.add_argument("command", nargs="?", default="run", help="Command (run)")
+    parser.add_argument("--input", required=True, help="Path to CLIInput JSON file")
+    parser.add_argument("--output", required=True, help="Path to write CLIOutput JSON file")
+    args = parser.parse_args()
+
+    with open(args.input, "r") as f:
+        cli_input = json.load(f)
+
+    task = cli_input.get("task", {})
+    payload = task.get("payload", {})
+    artifact_dir = cli_input.get("artifact_dir", "/tmp/browser-artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+
+    start_urls = payload.get("start_urls", [])
+    steps = payload.get("steps", [])
+    assertions = payload.get("assertions", [])
+
+    # Start browser server if needed
+    ok, msg = start_server_if_needed()
+    if not ok:
+        output = {
+            "outcome": "blocked",
+            "summary": f"Browser server not available: {msg}",
+            "evidence_files": [],
+            "stability_hints": ["requires_browser_serve", "requires_selenium"],
+        }
+        with open(args.output, "w") as f:
+            json.dump(output, f, indent=2)
+        return
+
+    evidence_files = []
+    step_log = []
+
+    # Navigate to start URLs
+    for url in start_urls:
+        stdout, stderr, rc = run_cmd(["goto", url])
+        if rc != 0:
+            step_log.append({"action": f"goto {url}", "success": False, "detail": stderr})
+        else:
+            run_cmd(["wait", "load"], timeout=10)
+            step_log.append({"action": f"goto {url}", "success": True, "detail": "navigated"})
+
+    # Execute steps
+    for i, step in enumerate(steps):
+        success, detail = execute_step(step, artifact_dir, i + 1)
+        step_log.append({"action": step, "success": success, "detail": detail})
+        time.sleep(0.3)  # Brief pause between steps for page updates
+
+    # Take a final screenshot
+    final_screenshot = os.path.join(artifact_dir, "final.png")
+    run_cmd(["screenshot", final_screenshot])
+    if os.path.exists(final_screenshot):
+        evidence_files.append(final_screenshot)
+
+    # Check assertions
+    assertion_results = []
+    passed = 0
+    failed = 0
+    for i, assertion in enumerate(assertions):
+        ok, detail = check_assertion(assertion, artifact_dir, i)
+        assertion_results.append({
+            "assertion": assertion,
+            "passed": ok,
+            "detail": detail,
+        })
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+
+    # Write logs as evidence
+    log_path = os.path.join(artifact_dir, "browser-log.json")
+    with open(log_path, "w") as f:
+        json.dump({"steps": step_log, "assertions": assertion_results}, f, indent=2)
+    evidence_files.append(log_path)
+
+    # Determine outcome
+    step_failures = sum(1 for s in step_log if not s["success"])
+    if step_failures > 0 and failed > 0:
+        outcome = "fail"
+        summary = f"{step_failures} step error(s) and {failed}/{len(assertions)} assertions failed"
+    elif failed > 0:
+        outcome = "fail"
+        summary = f"{failed}/{len(assertions)} assertions failed"
+    elif step_failures > 0:
+        outcome = "error"
+        summary = f"{step_failures} step error(s), all assertions passed"
+    else:
+        outcome = "pass"
+        summary = f"All {passed} assertions passed, {len(steps)} steps succeeded"
+
+    output = {
+        "outcome": outcome,
+        "summary": summary,
+        "evidence_files": evidence_files,
+        "stability_hints": ["web_browser_automation"],
+    }
+
+    with open(args.output, "w") as f:
+        json.dump(output, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()

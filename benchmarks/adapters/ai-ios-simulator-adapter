@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+Adapter: bridges qa-agent's subprocess protocol to ai-computer-use via the iOS Simulator.
+
+Usage: ai-ios-simulator-adapter run --input INPUT_FILE --output OUTPUT_FILE
+
+Flow:
+1. Boot the iOS Simulator for the requested device profile
+2. Install the app into the simulator
+3. Launch the app
+4. Position the Simulator window for better vision accuracy
+5. Capture a pre-flight diagnostic screenshot
+6. Call ai-computer-use with --start-app Simulator to interact with the sim window
+7. Capture a final screenshot via simctl
+8. Shut down the simulator
+9. Write CLIOutput JSON
+
+Supports provider selection (Gemini default, Anthropic fallback) via payload
+fields or environment variables QA_BENCH_PROVIDER / QA_BENCH_MODEL.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+# Import shared utilities
+sys.path.insert(0, os.path.dirname(__file__))
+from adapter_utils import (
+    check_api_key,
+    check_cli_available,
+    build_prompt,
+    collect_evidence,
+    write_output,
+    build_ai_command,
+    parse_outcome,
+)
+
+
+def check_xcrun_available():
+    """Check if xcrun simctl is available."""
+    try:
+        result = subprocess.run(
+            ["xcrun", "simctl", "list", "devices"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def boot_simulator(device_profile):
+    """Boot the iOS Simulator for the given device profile."""
+    # Shut down any already-booted device first (ignore errors)
+    subprocess.run(
+        ["xcrun", "simctl", "shutdown", "all"],
+        capture_output=True, timeout=15,
+    )
+    time.sleep(1)
+
+    result = subprocess.run(
+        ["xcrun", "simctl", "boot", device_profile],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        # May already be booted
+        if "current state: Booted" not in result.stderr:
+            return False, result.stderr
+    # Open Simulator.app so the window is visible
+    subprocess.run(["open", "-a", "Simulator"], capture_output=True, timeout=10)
+    time.sleep(3)  # let the simulator fully render
+    return True, ""
+
+
+def install_app(app_path):
+    """Install an app bundle into the booted simulator."""
+    result = subprocess.run(
+        ["xcrun", "simctl", "install", "booted", app_path],
+        capture_output=True, text=True, timeout=60,
+    )
+    return result.returncode == 0, result.stderr
+
+
+def launch_app(bundle_id):
+    """Launch an app in the booted simulator."""
+    result = subprocess.run(
+        ["xcrun", "simctl", "launch", "booted", bundle_id],
+        capture_output=True, text=True, timeout=15,
+    )
+    return result.returncode == 0, result.stderr
+
+
+def capture_screenshot(artifact_dir, name="final-sim.png"):
+    """Capture a screenshot from the booted simulator."""
+    path = os.path.join(artifact_dir, name)
+    result = subprocess.run(
+        ["xcrun", "simctl", "io", "booted", "screenshot", path],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode == 0 and os.path.isfile(path):
+        return path
+    return None
+
+
+def shutdown_simulator():
+    """Shut down all simulators."""
+    subprocess.run(
+        ["xcrun", "simctl", "shutdown", "all"],
+        capture_output=True, timeout=15,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ai-ios-simulator adapter")
+    parser.add_argument("command", nargs="?", default="run", help="Command (run)")
+    parser.add_argument("--input", required=True, help="Path to CLIInput JSON file")
+    parser.add_argument("--output", required=True, help="Path to write CLIOutput JSON file")
+    args = parser.parse_args()
+
+    with open(args.input, "r") as f:
+        cli_input = json.load(f)
+
+    task = cli_input.get("task", {})
+    payload = task.get("payload", {})
+    artifact_dir = cli_input.get("artifact_dir", "/tmp/ios-sim-artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+
+    app_bundle_id = payload.get("app_bundle_id", "")
+    app_path = payload.get("app_path", "")
+    app_name_override = payload.get("app_name", "")
+    device_profile = payload.get("device_profile", "iPhone 17")
+    steps = payload.get("steps", [])
+    assertions = payload.get("assertions", [])
+    max_steps = int(payload.get("max_steps", 50))
+    ui_context = payload.get("ui_context")
+
+    # Provider selection: payload > env var > default (gemini)
+    provider = payload.get("provider", os.environ.get("QA_BENCH_PROVIDER", "gemini"))
+    model_name = payload.get("model", os.environ.get("QA_BENCH_MODEL", "gemini-3-flash-preview"))
+
+    if app_name_override:
+        app_name = app_name_override
+    else:
+        app_name = app_bundle_id.split(".")[-1] if "." in app_bundle_id else app_bundle_id
+
+    # Pre-flight checks
+    if not check_api_key(provider):
+        write_output(args.output, {
+            "outcome": "blocked",
+            "summary": f"API key not set for provider '{provider}'",
+            "evidence_files": [],
+            "stability_hints": [f"requires_{provider}_api_key"],
+        })
+        return
+
+    if not check_cli_available("ai-computer-use"):
+        write_output(args.output, {
+            "outcome": "blocked",
+            "summary": "ai-computer-use CLI not found in PATH",
+            "evidence_files": [],
+            "stability_hints": ["requires_ai_computer_use"],
+        })
+        return
+
+    if not check_xcrun_available():
+        write_output(args.output, {
+            "outcome": "blocked",
+            "summary": "xcrun simctl not available (Xcode not installed?)",
+            "evidence_files": [],
+            "stability_hints": ["requires_xcode"],
+        })
+        return
+
+    # Boot simulator
+    ok, err = boot_simulator(device_profile)
+    if not ok:
+        write_output(args.output, {
+            "outcome": "blocked",
+            "summary": f"Failed to boot simulator '{device_profile}': {err}",
+            "evidence_files": [],
+            "stability_hints": ["simulator_boot_failed"],
+        })
+        return
+
+    try:
+        # Install app if path is provided
+        if app_path and os.path.isdir(app_path):
+            ok, err = install_app(app_path)
+            if not ok:
+                write_output(args.output, {
+                    "outcome": "error",
+                    "summary": f"Failed to install app: {err}",
+                    "evidence_files": [],
+                    "stability_hints": ["simctl_install_failed"],
+                })
+                return
+
+        # Launch app
+        if app_bundle_id:
+            ok, err = launch_app(app_bundle_id)
+            if not ok:
+                write_output(args.output, {
+                    "outcome": "error",
+                    "summary": f"Failed to launch {app_bundle_id}: {err}",
+                    "evidence_files": [],
+                    "stability_hints": ["simctl_launch_failed"],
+                })
+                return
+            time.sleep(3)  # extended readiness wait
+
+        # Position Simulator window for better vision accuracy
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "Simulator" to set bounds of front window to {200, 50, 700, 900}'],
+            capture_output=True, timeout=5,
+        )
+
+        # Build prompt with UI context
+        prompt = build_prompt(app_name, steps, assertions, ui_context=ui_context, surface="ios")
+
+        prompt_path = os.path.join(artifact_dir, "prompt.txt")
+        with open(prompt_path, "w") as f:
+            f.write(prompt)
+
+        screenshot_dir = os.path.join(artifact_dir, "screenshots")
+        os.makedirs(screenshot_dir, exist_ok=True)
+
+        # Pre-flight diagnostic screenshot
+        preflight_path = os.path.join(screenshot_dir, "00-pre-flight.png")
+        subprocess.run(
+            ["screencapture", "-x", preflight_path],
+            capture_output=True, timeout=10,
+        )
+
+        # Run ai-computer-use targeting the Simulator window
+        cmd = build_ai_command(
+            prompt, max_steps, screenshot_dir,
+            start_app="Simulator",
+            provider=provider,
+            model_name=model_name,
+        )
+
+        timeout_seconds = int(payload.get("max_wall_time_seconds", 300))
+        start_time = time.time()
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            # Capture final sim screenshot even on timeout
+            capture_screenshot(artifact_dir)
+            write_output(args.output, {
+                "outcome": "error",
+                "summary": f"ai-computer-use timed out after {timeout_seconds}s",
+                "evidence_files": collect_evidence(
+                    artifact_dir, screenshot_dir, extra_files=["final-sim.png"]
+                ),
+                "stability_hints": ["experimental_surface_ios", "timeout"],
+            })
+            return
+
+        elapsed = time.time() - start_time
+
+        # Save stdout/stderr
+        stdout_path = os.path.join(artifact_dir, "stdout.log")
+        stderr_path = os.path.join(artifact_dir, "stderr.log")
+        with open(stdout_path, "w") as f:
+            f.write(result.stdout)
+        with open(stderr_path, "w") as f:
+            f.write(result.stderr)
+
+        # Capture a final simulator screenshot for evidence
+        capture_screenshot(artifact_dir)
+
+        evidence = collect_evidence(
+            artifact_dir, screenshot_dir, extra_files=["final-sim.png"]
+        )
+
+        # Parse outcome using structured verdict + fallback
+        outcome, summary = parse_outcome(result, elapsed)
+
+        write_output(args.output, {
+            "outcome": outcome,
+            "summary": summary,
+            "evidence_files": evidence,
+            "stability_hints": [
+                "experimental_surface_ios",
+                "ios_simulator_via_computer_use",
+                "ai_vision_driven",
+            ],
+        })
+
+    finally:
+        shutdown_simulator()
+
+
+if __name__ == "__main__":
+    main()

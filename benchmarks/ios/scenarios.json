@@ -1,0 +1,195 @@
+{
+  "surface": "ios",
+  "status": "simulator",
+  "note": "iOS tests run via the iOS Simulator + ai-computer-use. The simulator is a macOS window that ai-computer-use can see and interact with.",
+  "build_clean": "xcodebuild build -scheme ContactsApp -destination 'platform=iOS Simulator,name=iPhone 17' -derivedDataPath /tmp/contactsapp-build-clean",
+  "build_buggy": "xcodebuild build -scheme ContactsApp -destination 'platform=iOS Simulator,name=iPhone 17' -derivedDataPath /tmp/contactsapp-build-buggy SWIFT_ACTIVE_COMPILATION_CONDITIONS=BUGGY",
+  "ui_context": {
+    "layout": "NavigationStack with List. Top stats section shows contact count and favorites count. All Contacts section with rows showing name, email, star icon. Toolbar + button for adding. Search bar at top.",
+    "tips": [
+      "This is an iOS app in the Simulator window",
+      "Tap contact rows to see detail with Full Name",
+      "The + button is top-right toolbar",
+      "Swipe left on a row to reveal Delete",
+      "The search bar is at the top of the list — pull down to reveal it if hidden"
+    ],
+    "accessibility_ids": {
+      "contact-stats": "N contacts / N favorites",
+      "full-name": "full name in detail view"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "IOS-CLEAN-1",
+      "name": "full_name_order_correct",
+      "description": "Clean: Full name shows 'FirstName LastName'",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "clean",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Tap on the first contact row (Alice Smith) to open the detail view"
+      ],
+      "assertions": [
+        "The detail view shows the full name as 'Alice Smith' (first name before last name, not 'Smith Alice')"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "IOS-CLEAN-2",
+      "name": "add_contact_sorted",
+      "description": "Clean: New contacts are sorted alphabetically",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "clean",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Tap the + button in the top-right toolbar to add a new contact",
+        "Enter 'Aaron' as the first name",
+        "Enter 'Adams' as the last name",
+        "Enter 'aaron@example.com' as the email",
+        "Tap Save to save the new contact"
+      ],
+      "assertions": [
+        "Back on the main list, 'Aaron Adams' appears at or near the top of the contact list (sorted alphabetically before Alice)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "IOS-CLEAN-3",
+      "name": "delete_correct_contact",
+      "description": "Clean: Swipe-to-delete removes the correct contact",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "clean",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Note the name of the first contact in the list (it should be Alice Smith)",
+        "Swipe left on the first contact row to reveal the Delete action, then tap Delete"
+      ],
+      "assertions": [
+        "Alice Smith is no longer in the contact list (the first contact has been removed)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "IOS-CLEAN-4",
+      "name": "search_finds_lastname",
+      "description": "Clean: Search matches first name, last name, and email",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "clean",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Tap the search bar at the top of the list (pull down to reveal if needed)",
+        "Type 'Smith' into the search field"
+      ],
+      "assertions": [
+        "Alice Smith appears in the filtered search results (searching by last name works)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "IOS-CLEAN-5",
+      "name": "favorite_count_correct",
+      "description": "Clean: Favorite count shows the actual number of favorites",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "clean",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Look at the stats section at the top of the list"
+      ],
+      "assertions": [
+        "The favorites count displays '2 favorites' (Alice and Carol are pre-set as favorites, not 0)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "IOS-BUG-1",
+      "name": "full_name_order_wrong",
+      "description": "Buggy: Full name shows 'LastName FirstName' instead of 'FirstName LastName'",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "buggy",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Tap on the first contact row (Alice Smith) to open the detail view"
+      ],
+      "assertions": [
+        "The detail view shows the full name as 'Alice Smith' (first name before last name, not 'Smith Alice')"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "IOS-BUG-2",
+      "name": "add_contact_unsorted",
+      "description": "Buggy: New contacts are appended instead of sorted alphabetically",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "buggy",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Tap the + button in the top-right toolbar to add a new contact",
+        "Enter 'Aaron' as the first name",
+        "Enter 'Adams' as the last name",
+        "Enter 'aaron@example.com' as the email",
+        "Tap Save to save the new contact"
+      ],
+      "assertions": [
+        "Back on the main list, 'Aaron Adams' appears at or near the top of the contact list (sorted alphabetically before Alice)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "IOS-BUG-3",
+      "name": "delete_wrong_contact",
+      "description": "Buggy: Swipe-to-delete removes the wrong contact (off by one)",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "buggy",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Note the name of the first contact in the list (it should be Alice Smith)",
+        "Swipe left on the first contact row to reveal the Delete action, then tap Delete"
+      ],
+      "assertions": [
+        "Alice Smith is no longer in the contact list (the first contact has been removed)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "IOS-BUG-4",
+      "name": "search_misses_lastname",
+      "description": "Buggy: Search only checks first name, misses last name and email",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "buggy",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Tap the search bar at the top of the list (pull down to reveal if needed)",
+        "Type 'Smith' into the search field"
+      ],
+      "assertions": [
+        "Alice Smith appears in the filtered search results (searching by last name works)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "IOS-BUG-5",
+      "name": "favorite_count_always_zero",
+      "description": "Buggy: Favorite count always shows 0 regardless of actual favorites",
+      "app_bundle_id": "com.benchmark.contactsapp",
+      "device_profile": "iPhone 17",
+      "build": "buggy",
+      "steps": [
+        "The ContactsApp should be visible in the Simulator",
+        "Look at the stats section at the top of the list"
+      ],
+      "assertions": [
+        "The favorites count displays '2 favorites' (Alice and Carol are pre-set as favorites, not 0)"
+      ],
+      "expect_outcome": "fail"
+    }
+  ]
+}

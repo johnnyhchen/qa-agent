@@ -23,3 +23,10 @@ artifacts/
 .idea/
 .vscode/
 
+
+# Benchmark build artifacts
+.build/
+*.app/
+__pycache__/
+*.pyc
+node_modules/

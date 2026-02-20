@@ -1,0 +1,14 @@
+{
+  "name": "benchmark-notes",
+  "version": "1.0.0",
+  "description": "Benchmark note-taking app with clean and buggy modes",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron . --mode clean",
+    "start:buggy": "electron . --mode buggy",
+    "start:clean": "electron . --mode clean"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

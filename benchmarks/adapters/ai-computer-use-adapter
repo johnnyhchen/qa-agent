@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+Adapter: bridges qa-agent's subprocess protocol to `ai-computer-use`.
+
+Usage: ai-computer-use-adapter run --input INPUT_FILE --output OUTPUT_FILE
+
+Reads CLIInput JSON, builds a natural language prompt from the task payload,
+calls ai-computer-use with appropriate flags, and writes CLIOutput JSON.
+
+The prompt instructs the AI to:
+1. Perform each step in sequence
+2. After completing all steps, verify each assertion
+3. Output a structured JSON verdict (PASS/FAIL)
+
+Supports provider selection (Gemini default, Anthropic fallback) via payload
+fields or environment variables QA_BENCH_PROVIDER / QA_BENCH_MODEL.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+# Import shared utilities
+sys.path.insert(0, os.path.dirname(__file__))
+from adapter_utils import (
+    check_api_key,
+    check_cli_available,
+    build_prompt,
+    collect_evidence,
+    write_output,
+    build_ai_command,
+    parse_outcome,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="ai-computer-use adapter")
+    parser.add_argument("command", nargs="?", default="run", help="Command (run)")
+    parser.add_argument("--input", required=True, help="Path to CLIInput JSON file")
+    parser.add_argument("--output", required=True, help="Path to write CLIOutput JSON file")
+    args = parser.parse_args()
+
+    with open(args.input, "r") as f:
+        cli_input = json.load(f)
+
+    task = cli_input.get("task", {})
+    payload = task.get("payload", {})
+    artifact_dir = cli_input.get("artifact_dir", "/tmp/computer-use-artifacts")
+    os.makedirs(artifact_dir, exist_ok=True)
+
+    app_bundle_id = payload.get("app_bundle_id", "")
+    app_path = payload.get("app_path", "")
+    app_name_override = payload.get("app_name", "")
+    steps = payload.get("steps", [])
+    assertions = payload.get("assertions", [])
+    max_steps = int(payload.get("max_steps", 50))
+    ui_context = payload.get("ui_context")
+
+    # Provider selection: payload > env var > default (gemini)
+    provider = payload.get("provider", os.environ.get("QA_BENCH_PROVIDER", "gemini"))
+    model_name = payload.get("model", os.environ.get("QA_BENCH_MODEL", "gemini-3-flash-preview"))
+
+    # Use explicit app_name if provided, otherwise derive from bundle ID
+    if app_name_override:
+        app_name = app_name_override
+    else:
+        app_name = app_bundle_id.split(".")[-1] if "." in app_bundle_id else app_bundle_id
+
+    # Pre-flight checks
+    if not check_api_key(provider):
+        write_output(args.output, {
+            "outcome": "blocked",
+            "summary": f"API key not set for provider '{provider}'",
+            "evidence_files": [],
+            "stability_hints": [f"requires_{provider}_api_key"],
+        })
+        return
+
+    if not check_cli_available():
+        write_output(args.output, {
+            "outcome": "blocked",
+            "summary": "ai-computer-use CLI not found in PATH",
+            "evidence_files": [],
+            "stability_hints": ["requires_ai_computer_use"],
+        })
+        return
+
+    # If app_path is set, launch the .app bundle with `open` so LaunchServices
+    # registers it and --start-app can find it by name.
+    if app_path and os.path.isdir(app_path):
+        subprocess.run(["open", app_path], check=True, timeout=10)
+        time.sleep(3)  # extended readiness wait
+
+        # Resize window for better vision model accuracy
+        resize_script = (
+            f'tell application "{app_name}" to set bounds of front window '
+            f'to {{100, 100, 900, 700}}'
+        )
+        subprocess.run(
+            ["osascript", "-e", resize_script],
+            capture_output=True, timeout=5,
+        )
+
+    # Build prompt with UI context
+    prompt = build_prompt(app_name, steps, assertions, ui_context=ui_context, surface="macos")
+
+    # Save prompt as evidence
+    prompt_path = os.path.join(artifact_dir, "prompt.txt")
+    with open(prompt_path, "w") as f:
+        f.write(prompt)
+
+    screenshot_dir = os.path.join(artifact_dir, "screenshots")
+    os.makedirs(screenshot_dir, exist_ok=True)
+
+    # Pre-flight diagnostic screenshot
+    preflight_path = os.path.join(screenshot_dir, "00-pre-flight.png")
+    subprocess.run(
+        ["screencapture", "-x", preflight_path],
+        capture_output=True, timeout=10,
+    )
+
+    # Run ai-computer-use
+    cmd = build_ai_command(
+        prompt, max_steps, screenshot_dir,
+        start_app=app_name,
+        provider=provider,
+        model_name=model_name,
+    )
+
+    start_time = time.time()
+    timeout_seconds = int(payload.get("max_wall_time_seconds", 300))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        write_output(args.output, {
+            "outcome": "error",
+            "summary": f"ai-computer-use timed out after {timeout_seconds}s",
+            "evidence_files": collect_evidence(artifact_dir, screenshot_dir),
+            "stability_hints": ["experimental_surface_macos", "timeout"],
+        })
+        return
+
+    elapsed = time.time() - start_time
+
+    # Save stdout/stderr as evidence
+    stdout_path = os.path.join(artifact_dir, "stdout.log")
+    stderr_path = os.path.join(artifact_dir, "stderr.log")
+    with open(stdout_path, "w") as f:
+        f.write(result.stdout)
+    with open(stderr_path, "w") as f:
+        f.write(result.stderr)
+
+    evidence = collect_evidence(artifact_dir, screenshot_dir)
+
+    # Parse outcome using structured verdict + fallback
+    outcome, summary = parse_outcome(result, elapsed)
+
+    write_output(args.output, {
+        "outcome": outcome,
+        "summary": summary,
+        "evidence_files": evidence,
+        "stability_hints": [
+            "experimental_surface_macos",
+            "macos_runner_nondeterminism_possible",
+            "ai_vision_driven",
+        ],
+    })
+
+
+if __name__ == "__main__":
+    main()

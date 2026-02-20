@@ -1,0 +1,209 @@
+{
+  "surface": "macos",
+  "ui_context": {
+    "layout": "HSplitView. Left: title, segmented category picker, two dropdown Pickers (From/To), a text input field with 'Enter value' placeholder, a green Convert button, result display. Right: history panel with Clear button and count.",
+    "tips": [
+      "From/To controls are dropdown Pickers (popup menus), NOT text fields",
+      "The input field is the only editable text field — it shows 'Enter value'",
+      "Click directly on the text that says 'Enter value' to focus the input",
+      "After typing a number, click the green Convert button or press Return",
+      "The result appears below as 'X Unit = Y Unit'"
+    ],
+    "accessibility_ids": {
+      "conversion-result": "conversion result text",
+      "history-count": "'N conversion(s)' count"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "MAC-CLEAN-1",
+      "name": "temperature_conversion_correct",
+      "description": "Clean: Fahrenheit conversion uses correct formula (100C = 212F)",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "clean",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select the Temperature category from the segmented picker at the top",
+        "Set the From dropdown Picker to Celsius",
+        "Set the To dropdown Picker to Fahrenheit",
+        "Click on the text field showing 'Enter value' (NOT the dropdown Pickers above it)",
+        "Type 100",
+        "Click the green 'Convert' button or press Return"
+      ],
+      "assertions": [
+        "The conversion result area displays a number containing 212 (100°C = 212°F)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "MAC-CLEAN-2",
+      "name": "miles_conversion_correct",
+      "description": "Clean: Miles-to-Kilometers converts correctly (1 mi = ~1.6093 km)",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "clean",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select the Length category from the segmented picker",
+        "Set the From dropdown Picker to Miles",
+        "Set the To dropdown Picker to Kilometers",
+        "Click on the text field showing 'Enter value' (NOT the dropdown Pickers)",
+        "Type 1",
+        "Click the green 'Convert' button or press Return"
+      ],
+      "assertions": [
+        "The conversion result area displays a number approximately equal to 1.6093 (between 1.60 and 1.61)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "MAC-CLEAN-3",
+      "name": "clear_history_works",
+      "description": "Clean: Clear history removes all entries",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "clean",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select Temperature category, set Celsius to Fahrenheit, type 100, click Convert",
+        "Clear the input, type 50, click Convert again",
+        "Clear the input, type 0, click Convert again",
+        "In the History panel on the right side, click the 'Clear' button"
+      ],
+      "assertions": [
+        "The history panel shows the text 'No conversions yet' (all entries are removed)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "MAC-CLEAN-4",
+      "name": "toggle_history_works",
+      "description": "Clean: Toggle history panel hides the panel",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "clean",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Look for and click the 'Hide History' button in the toolbar area"
+      ],
+      "assertions": [
+        "The history panel on the right side is no longer visible (the right panel is hidden)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "MAC-CLEAN-5",
+      "name": "single_history_entry",
+      "description": "Clean: Each conversion adds exactly one history entry",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "clean",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select Temperature category, set Celsius to Fahrenheit",
+        "Click on the text field showing 'Enter value', type 100",
+        "Click the green 'Convert' button"
+      ],
+      "assertions": [
+        "The history panel shows exactly '1 conversion' (not 2 or more)"
+      ],
+      "expect_outcome": "pass"
+    },
+    {
+      "id": "MAC-BUG-1",
+      "name": "temperature_conversion_wrong",
+      "description": "Buggy: Fahrenheit conversion uses wrong formula (+23 instead of +32)",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "buggy",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select the Temperature category from the segmented picker at the top",
+        "Set the From dropdown Picker to Celsius",
+        "Set the To dropdown Picker to Fahrenheit",
+        "Click on the text field showing 'Enter value' (NOT the dropdown Pickers above it)",
+        "Type 100",
+        "Click the green 'Convert' button or press Return"
+      ],
+      "assertions": [
+        "The conversion result area displays a number containing 212 (100°C = 212°F)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "MAC-BUG-2",
+      "name": "miles_conversion_wrong",
+      "description": "Buggy: Miles-to-Kilometers uses 1000 instead of 1609.34",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "buggy",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select the Length category from the segmented picker",
+        "Set the From dropdown Picker to Miles",
+        "Set the To dropdown Picker to Kilometers",
+        "Click on the text field showing 'Enter value' (NOT the dropdown Pickers)",
+        "Type 1",
+        "Click the green 'Convert' button or press Return"
+      ],
+      "assertions": [
+        "The conversion result area displays a number approximately equal to 1.6093 (between 1.60 and 1.61)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "MAC-BUG-3",
+      "name": "clear_history_only_removes_first",
+      "description": "Buggy: Clear history only removes the first entry instead of all",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "buggy",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select Temperature category, set Celsius to Fahrenheit, type 100, click Convert",
+        "Clear the input, type 50, click Convert again",
+        "Clear the input, type 0, click Convert again",
+        "In the History panel on the right side, click the 'Clear' button"
+      ],
+      "assertions": [
+        "The history panel shows the text 'No conversions yet' (all entries are removed)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "MAC-BUG-4",
+      "name": "toggle_history_broken",
+      "description": "Buggy: Toggle history panel button does nothing",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "buggy",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Look for and click the 'Hide History' button in the toolbar area"
+      ],
+      "assertions": [
+        "The history panel on the right side is no longer visible (the right panel is hidden)"
+      ],
+      "expect_outcome": "fail"
+    },
+    {
+      "id": "MAC-BUG-5",
+      "name": "duplicate_history_entries",
+      "description": "Buggy: Each conversion adds two history entries instead of one",
+      "app": "UnitConverter",
+      "app_bundle_id": "com.benchmark.unitconverter",
+      "build": "buggy",
+      "steps": [
+        "Launch the UnitConverter app",
+        "Select Temperature category, set Celsius to Fahrenheit",
+        "Click on the text field showing 'Enter value', type 100",
+        "Click the green 'Convert' button"
+      ],
+      "assertions": [
+        "The history panel shows exactly '1 conversion' (not 2 or more)"
+      ],
+      "expect_outcome": "fail"
+    }
+  ]
+}
