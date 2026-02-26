@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"qa-agent/internal/agents/runtime"
@@ -41,11 +43,16 @@ func (a *Agent) Plan(ctx context.Context, runID, description string, surfaces []
 		surfaces = []model.Surface{model.SurfaceWeb}
 	}
 
-	_, _ = a.runtime.RunTurn(ctx, runtime.TurnRequest{
+	resp, err := a.runtime.RunTurn(ctx, runtime.TurnRequest{
 		RunID:     runID,
 		AgentName: "planner",
 		Prompt:    description,
 	})
+	_ = resp // LLM response logged to artifacts by runtime; payload generated deterministically below
+	if err != nil {
+		// Non-fatal: runtime may use EchoClient, log but continue
+		_ = err
+	}
 
 	criteria := splitCriteria(description)
 	openQuestions := buildOpenQuestions(description)
@@ -58,7 +65,7 @@ func (a *Agent) Plan(ctx context.Context, runID, description string, surfaces []
 		assertions = append(assertions, criterion.Text)
 		for _, surface := range surfaces {
 			taskID := fmt.Sprintf("task_%s_%d_%s", runID, idx+1, surface)
-			tasks = append(tasks, model.Task{
+			task := model.Task{
 				SchemaVersion: model.CurrentSchemaVersion,
 				TaskID:        taskID,
 				RunID:         runID,
@@ -72,7 +79,16 @@ func (a *Agent) Plan(ctx context.Context, runID, description string, surfaces []
 				AcceptanceCriteriaIDs: []string{
 					criterion.ID,
 				},
-			})
+			}
+
+			// Generate surface-specific payloads
+			if surface == model.SurfaceAPI {
+				task.Payload = buildAPIPayload(criterion.Text)
+			} else if surface == model.SurfaceWeb {
+				task.Payload = buildWebPayload(criterion.Text)
+			}
+
+			tasks = append(tasks, task)
 		}
 	}
 
@@ -107,6 +123,86 @@ func (a *Agent) Plan(ctx context.Context, runID, description string, surfaces []
 		}
 	}
 	return output, nil
+}
+
+// buildAPIPayload extracts HTTP request specifications from criterion text.
+// Recognizes patterns like "GET http://... returns JSON with status 200"
+// and builds the payload structure the API runner expects.
+func buildAPIPayload(criterionText string) map[string]any {
+	httpRequests := extractHTTPRequests(criterionText)
+	if len(httpRequests) == 0 {
+		return nil
+	}
+	reqs := make([]any, len(httpRequests))
+	for i, r := range httpRequests {
+		reqs[i] = r
+	}
+	return map[string]any{
+		"http_requests": reqs,
+	}
+}
+
+// httpRequestPattern matches "GET http://..." or "POST http://..." in text
+var httpRequestPattern = regexp.MustCompile(`(?i)(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(https?://[^\s,]+)`)
+
+// statusPattern matches "status 200", "status code 404", "returns 200", "with status 200"
+var statusPattern = regexp.MustCompile(`(?i)(?:status(?:\s+code)?|returns)\s+(\d{3})`)
+
+// bodyContainsPattern matches "containing X", "contains X", "body contains X"
+var bodyContainsPattern = regexp.MustCompile(`(?i)contain(?:s|ing)\s+(?:(?:the\s+)?(?:text|string|field|value)\s+)?["']?([^"'.]+)["']?`)
+
+func extractHTTPRequests(text string) []map[string]any {
+	matches := httpRequestPattern.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	var requests []map[string]any
+	for _, match := range matches {
+		method := strings.ToUpper(match[1])
+		url := strings.TrimRight(match[2], ".,;)")
+
+		req := map[string]any{
+			"method": method,
+			"url":    url,
+		}
+
+		// Extract expected status from surrounding text
+		statusMatch := statusPattern.FindStringSubmatch(text)
+		if statusMatch != nil {
+			code, err := strconv.Atoi(statusMatch[1])
+			if err == nil {
+				req["expect_status"] = float64(code)
+			}
+		} else {
+			// Default: expect 200 for GET requests
+			if method == "GET" {
+				req["expect_status"] = float64(200)
+			}
+		}
+
+		// Extract body contains assertion
+		bodyMatch := bodyContainsPattern.FindStringSubmatch(text)
+		if bodyMatch != nil {
+			req["expect_body_contains"] = strings.TrimSpace(bodyMatch[1])
+		}
+
+		requests = append(requests, req)
+	}
+	return requests
+}
+
+func buildWebPayload(criterionText string) map[string]any {
+	// Extract URL from text for web surface
+	urlPattern := regexp.MustCompile(`https?://[^\s,]+`)
+	urlMatch := urlPattern.FindString(criterionText)
+	if urlMatch == "" {
+		return nil
+	}
+	return map[string]any{
+		"url":     strings.TrimRight(urlMatch, ".,;)"),
+		"actions": []any{"navigate", "screenshot"},
+	}
 }
 
 func ValidateOutput(output Output) error {

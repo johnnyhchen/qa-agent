@@ -12,9 +12,20 @@ import (
 	"strings"
 	"time"
 
+	judgeagent "qa-agent/internal/agents/judge"
+	planneragent "qa-agent/internal/agents/planner"
+	"qa-agent/internal/agents/runtime"
+	"qa-agent/internal/blackboard"
 	"qa-agent/internal/config"
+	"qa-agent/internal/model"
+	"qa-agent/internal/orchestrator"
 	"qa-agent/internal/replay"
 	"qa-agent/internal/report"
+	apirunner "qa-agent/internal/runner/api"
+	iosrunner "qa-agent/internal/runner/ios"
+	macosrunner "qa-agent/internal/runner/macos"
+	webrunner "qa-agent/internal/runner/web"
+	"qa-agent/internal/trace"
 )
 
 const version = "0.1.0"
@@ -155,6 +166,60 @@ func runCommand(args []string, stdout, stderr io.Writer) error {
 
 	fmt.Fprintf(stdout, "run_id: %s\n", runID)
 	fmt.Fprintf(stdout, "artifacts: %s\n", runDir)
+
+	// ── Wire up and run the orchestrator ────────────────────────────
+	store, err := blackboard.NewStore(cfg.OutputDir)
+	if err != nil {
+		return fmt.Errorf("creating store: %w", err)
+	}
+
+	registry := runtime.NewToolRegistry()
+	rt := runtime.New(store, registry, nil, runtime.Config{})
+
+	plan := planneragent.New(rt, store)
+	judge := judgeagent.New()
+
+	logger := trace.NewLogger(stderr, false)
+	recorder := trace.NewRecorder(store, logger)
+
+	executors := map[model.Surface]orchestrator.Executor{
+		model.SurfaceAPI:   apirunner.NewAdapter(30 * time.Second),
+		model.SurfaceWeb:   webrunner.NewAdapter(cfg.ToolBins.AIBrowserUseBin, 2*time.Minute, recorder),
+		model.SurfaceMacOS: macosrunner.NewAdapter(cfg.ToolBins.AIComputerUseBin, 2*time.Minute, 50, recorder),
+		model.SurfaceIOS:   iosrunner.NewAdapter("xcrun"),
+	}
+
+	budget := orchestrator.Budget{
+		MaxQueuedTasks:          budgetSteps,
+		MaxNewTasksPerJudgeTurn: 10,
+		MaxJudgeTurns:           3,
+		MaxWallTime:             time.Duration(budgetMinutes) * time.Minute,
+		MaxRetriesPerTask:       3,
+	}
+
+	surfaceModels := make([]model.Surface, len(surfaces))
+	for i, s := range surfaces {
+		surfaceModels[i] = model.Surface(s)
+	}
+
+	orch := orchestrator.New(store, plan, judge, executors, budget)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(budgetMinutes)*time.Minute)
+	defer cancel()
+
+	verdict, err := orch.Run(ctx, orchestrator.Request{
+		RunID:       runID,
+		Description: feature,
+		Surfaces:    surfaceModels,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "orchestrator error: %v\n", err)
+	}
+
+	// Write verdict to run directory
+	verdictRaw, _ := json.MarshalIndent(verdict, "", "  ")
+	_ = os.WriteFile(filepath.Join(runDir, "verdict.json"), verdictRaw, 0o644)
+
+	fmt.Fprintf(stdout, "verdict: %s\n", verdict.Status)
 	return nil
 }
 
