@@ -195,6 +195,11 @@ func (o *Orchestrator) Run(ctx context.Context, request Request) (model.Verdict,
 			return model.Verdict{}, err
 		}
 		if judgeOutput.Verdict != nil {
+			// Attach findings from the judge output to the verdict so they
+			// are persisted in verdict.json and available to the report.
+			if len(judgeOutput.Findings) > 0 && len(judgeOutput.Verdict.Findings) == 0 {
+				judgeOutput.Verdict.Findings = judgeOutput.Findings
+			}
 			if err := o.store.UpsertVerdict(ctx, *judgeOutput.Verdict); err != nil {
 				return model.Verdict{}, err
 			}

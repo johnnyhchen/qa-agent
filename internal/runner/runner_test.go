@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,31 @@ import (
 	"qa-agent/internal/sandbox"
 	"qa-agent/internal/trace"
 )
+
+// TestFakeRunnerHelper is the helper process that acts as a fake runner binary.
+// It is invoked as a subprocess by the real test below.
+func TestFakeRunnerHelper(t *testing.T) {
+	if os.Getenv("QA_AGENT_TEST_HELPER") != "1" {
+		return
+	}
+	var outputPath string
+	args := os.Args
+	for i, arg := range args {
+		if arg == "--output" && i+1 < len(args) {
+			outputPath = args[i+1]
+		}
+	}
+	if outputPath == "" {
+		fmt.Fprintln(os.Stderr, "missing output path")
+		os.Exit(2)
+	}
+	payload := `{"outcome":"pass","summary":"ok","evidence_files":["artifact.log"],"stability_hints":["stable"]}`
+	if err := os.WriteFile(outputPath, []byte(payload), 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
 
 func TestSubprocessRunnerExecutesFakeRunnerAndStoresTrace(t *testing.T) {
 	store, err := blackboard.NewStore(t.TempDir())
@@ -32,13 +58,14 @@ func TestSubprocessRunnerExecutesFakeRunnerAndStoresTrace(t *testing.T) {
 		t.Fatalf("CreateValidationRun() error = %v", err)
 	}
 
-	fakeRunner := writeFakeRunner(t)
 	recorder := trace.NewRecorder(store, trace.NewLogger(new(bytes.Buffer), true))
 	subprocessRunner := &SubprocessRunner{
-		Name:          "fake",
-		Binary:        fakeRunner,
-		BaseArgs:      nil,
-		Timeout:       2 * time.Second,
+		Name:   "fake",
+		Binary: os.Args[0],
+		BaseArgs: []string{
+			"-test.run=TestFakeRunnerHelper", "--",
+		},
+		Timeout:       10 * time.Second,
 		TraceRecorder: recorder,
 	}
 
@@ -54,6 +81,9 @@ func TestSubprocessRunnerExecutesFakeRunnerAndStoresTrace(t *testing.T) {
 		MaxAttempts:   1,
 	}
 	artifactDir := filepath.Join(store.ArtifactDir(runID), "runner")
+
+	// Set the env var so the helper process knows to act as a runner.
+	t.Setenv("QA_AGENT_TEST_HELPER", "1")
 
 	result, err := subprocessRunner.Run(context.Background(), task, sandbox.Sandbox{
 		ID:    "sandbox_1",
@@ -91,30 +121,4 @@ func TestSubprocessRunnerExecutesFakeRunnerAndStoresTrace(t *testing.T) {
 	if !strings.Contains(string(outputRaw), `"outcome":"pass"`) {
 		t.Fatalf("output json did not contain pass outcome: %s", string(outputRaw))
 	}
-}
-
-func writeFakeRunner(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake-runner.sh")
-	script := `#!/bin/sh
-input=""
-output=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --input) input="$2"; shift 2;;
-    --output) output="$2"; shift 2;;
-    *) shift;;
-  esac
-done
-if [ -z "$output" ]; then
-  echo "missing output path" >&2
-  exit 2
-fi
-echo '{"outcome":"pass","summary":"ok","evidence_files":["artifact.log"],"stability_hints":["stable"]}' > "$output"
-exit 0
-`
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile(fake runner) error = %v", err)
-	}
-	return path
 }

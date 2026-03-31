@@ -1,0 +1,8 @@
+{
+  "output_dir": ".qa-agent/runs",
+  "tool_bins": {
+    "ai_browser_use_bin": "ai-browser-use",
+    "ai_computer_use_bin": "ai-computer-use",
+    "docker_bin": "docker"
+  }
+}

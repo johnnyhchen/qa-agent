@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"qa-agent/internal/model"
 )
 
 type Manifest struct {
@@ -18,11 +20,20 @@ type Manifest struct {
 	Files       []string `json:"files"`
 }
 
+type TaskSummary struct {
+	Total   int
+	Passed  int
+	Failed  int
+	Errored int
+	Blocked int
+}
+
 type Summary struct {
 	RunID         string
 	GeneratedAt   time.Time
-	Verdict       string
+	Verdict       model.Verdict
 	ArtifactCount int
+	TaskSummary   TaskSummary
 }
 
 type Generator struct{}
@@ -41,11 +52,13 @@ func (g *Generator) Generate(runID, runDir string) (Summary, Manifest, string, e
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Files:       files,
 	}
+	verdict := loadVerdict(runDir)
 	summary := Summary{
 		RunID:         runID,
 		GeneratedAt:   time.Now().UTC(),
-		Verdict:       detectVerdict(runDir),
+		Verdict:       verdict,
 		ArtifactCount: len(files),
+		TaskSummary:   loadTaskSummary(verdict),
 	}
 	markdown := buildMarkdown(summary, manifest)
 	return summary, manifest, markdown, nil
@@ -114,42 +127,122 @@ func (g *Generator) Bundle(runID, runDir, outputZip string) error {
 }
 
 func buildMarkdown(summary Summary, manifest Manifest) string {
-	lines := []string{
-		"# QA-Agent Report",
-		"",
-		"## Verdict",
-		fmt.Sprintf("- Run ID: `%s`", summary.RunID),
-		fmt.Sprintf("- Status: `%s`", summary.Verdict),
-		fmt.Sprintf("- Generated At: `%s`", summary.GeneratedAt.UTC().Format(time.RFC3339Nano)),
-		"",
-		"## Coverage",
-		fmt.Sprintf("- Artifact files: `%d`", summary.ArtifactCount),
-		"",
-		"## Evidence Bundle",
-		"- See `manifest.json` for the full artifact list.",
-		"",
-		"## Findings",
-		"- See trace and transcript artifacts for detailed findings.",
+	var b strings.Builder
+
+	// Header
+	b.WriteString("# QA-Agent Report\n\n")
+
+	// Verdict section
+	b.WriteString("## Verdict\n")
+	b.WriteString(fmt.Sprintf("- Run ID: `%s`\n", summary.RunID))
+	status := string(summary.Verdict.Status)
+	if status == "" {
+		status = "unknown"
 	}
-	return strings.Join(lines, "\n")
+	b.WriteString(fmt.Sprintf("- Status: `%s`\n", status))
+	b.WriteString(fmt.Sprintf("- Generated At: `%s`\n", summary.GeneratedAt.UTC().Format(time.RFC3339Nano)))
+
+	if len(summary.Verdict.Reasons) > 0 {
+		b.WriteString("\n### Reasons\n")
+		for _, reason := range summary.Verdict.Reasons {
+			b.WriteString(fmt.Sprintf("- %s\n", reason))
+		}
+	}
+
+	// Coverage section
+	b.WriteString("\n## Coverage\n")
+	b.WriteString(fmt.Sprintf("- Artifact files: `%d`\n", summary.ArtifactCount))
+	if len(summary.Verdict.Coverage) > 0 {
+		b.WriteString("\n| Criterion | Status | Evidence |\n")
+		b.WriteString("|-----------|--------|----------|\n")
+		keys := make([]string, 0, len(summary.Verdict.Coverage))
+		for k := range summary.Verdict.Coverage {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, criterion := range keys {
+			refs := summary.Verdict.Coverage[criterion]
+			coverageStatus := "covered"
+			if len(refs) == 1 && refs[0] == "missing" {
+				coverageStatus = "missing"
+			}
+			b.WriteString(fmt.Sprintf("| %s | %s | %s |\n", criterion, coverageStatus, strings.Join(refs, ", ")))
+		}
+	}
+
+	// Findings section
+	b.WriteString("\n## Findings\n")
+	if len(summary.Verdict.Findings) > 0 {
+		for _, finding := range summary.Verdict.Findings {
+			b.WriteString(fmt.Sprintf("\n### Finding: %s\n", finding.FindingID))
+			b.WriteString(fmt.Sprintf("- **Severity**: %s\n", finding.Severity))
+			b.WriteString(fmt.Sprintf("- **Criterion**: %s\n", finding.CriterionID))
+			b.WriteString(fmt.Sprintf("- **Summary**: %s\n", finding.Summary))
+			if len(finding.ReproSteps) > 0 {
+				b.WriteString("- **Repro Steps**:\n")
+				for i, step := range finding.ReproSteps {
+					b.WriteString(fmt.Sprintf("  %d. %s\n", i+1, step))
+				}
+			}
+			if len(finding.EvidenceRefs) > 0 {
+				b.WriteString(fmt.Sprintf("- **Evidence**: %s\n", strings.Join(finding.EvidenceRefs, ", ")))
+			}
+		}
+	} else {
+		b.WriteString("- No findings.\n")
+	}
+
+	// Task Summary section
+	b.WriteString("\n## Task Summary\n")
+	ts := summary.TaskSummary
+	b.WriteString(fmt.Sprintf("- Total: %d\n", ts.Total))
+	b.WriteString(fmt.Sprintf("- Passed: %d\n", ts.Passed))
+	b.WriteString(fmt.Sprintf("- Failed: %d\n", ts.Failed))
+	b.WriteString(fmt.Sprintf("- Errored: %d\n", ts.Errored))
+	b.WriteString(fmt.Sprintf("- Blocked: %d\n", ts.Blocked))
+
+	// Evidence Bundle section
+	b.WriteString("\n## Evidence Bundle\n")
+	b.WriteString("- See `manifest.json` for the full artifact list.\n")
+
+	return b.String()
 }
 
-func detectVerdict(runDir string) string {
+func loadVerdict(runDir string) model.Verdict {
 	verdictPath := filepath.Join(runDir, "verdict.json")
 	raw, err := os.ReadFile(verdictPath)
 	if err != nil {
-		return "unknown"
+		return model.Verdict{}
 	}
-	var payload struct {
-		Status string `json:"status"`
+	var v model.Verdict
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return model.Verdict{}
 	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "unknown"
+	return v
+}
+
+func loadTaskSummary(verdict model.Verdict) TaskSummary {
+	if len(verdict.Coverage) == 0 {
+		return TaskSummary{}
 	}
-	if strings.TrimSpace(payload.Status) == "" {
-		return "unknown"
+
+	failedCriteria := map[string]bool{}
+	for _, f := range verdict.Findings {
+		failedCriteria[f.CriterionID] = true
 	}
-	return payload.Status
+
+	ts := TaskSummary{Total: len(verdict.Coverage)}
+	for criterion, refs := range verdict.Coverage {
+		isMissing := len(refs) == 1 && refs[0] == "missing"
+		if failedCriteria[criterion] {
+			ts.Failed++
+		} else if isMissing {
+			ts.Blocked++
+		} else {
+			ts.Passed++
+		}
+	}
+	return ts
 }
 
 func listFiles(runDir string) ([]string, error) {

@@ -59,7 +59,7 @@ func (a *Adapter) Doctor(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("macOS runner binary not found (%s): %w", a.binary, err)
 	}
-	versionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	versionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(versionCtx, path, "--version")
 	if err := cmd.Run(); err != nil {

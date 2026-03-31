@@ -142,6 +142,15 @@ func (a *Adapter) executeHTTP(ctx context.Context, request HTTPRequest) (transcr
 	for key, value := range request.Headers {
 		req.Header.Set(key, value)
 	}
+	// Default Content-Type to application/json for mutation methods
+	// when the caller hasn't set it explicitly. Many APIs (Axum, Express)
+	// reject requests without this header even when the body is empty.
+	if req.Header.Get("Content-Type") == "" {
+		switch method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch:
+			req.Header.Set("Content-Type", "application/json")
+		}
+	}
 
 	response, err := a.client.Do(req)
 	entry := transcriptEntry{
